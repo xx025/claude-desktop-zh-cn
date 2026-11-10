@@ -53,8 +53,8 @@ find_bundle_files() {
 }
 
 app_version() {
-  cat "$APP_DIR/version" 2>/dev/null \
-    || dpkg-query -W -f='${Version}' claude-desktop 2>/dev/null \
+  dpkg-query -W -f='${Version}' claude-desktop 2>/dev/null \
+    || cat "$APP_DIR/version" 2>/dev/null \
     || echo "unknown"
 }
 
@@ -93,7 +93,64 @@ json.dump(merged, open(out_p, "w"), ensure_ascii=False, indent=2)
 PY
 }
 
+set_user_locale() {
+  python3 - "$HOME" "$SUFFIX" <<'PY'
+import json, os, sys
+home, lang = sys.argv[1:3]
+for dirname in ("Claude", "Claude-3p"):
+    parent = os.path.join(home, ".config", dirname)
+    if dirname == "Claude-3p" and not os.path.isdir(parent):
+        continue
+    os.makedirs(parent, exist_ok=True)
+    path = os.path.join(parent, "config.json")
+    cfg = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            cfg = json.load(handle)
+    cfg["locale"] = lang
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(cfg, handle, ensure_ascii=False, indent="\t")
+PY
+}
+
+install_asar_frontend() {
+  command -v python3 >/dev/null || die "需要 python3"
+  [ -f "$APP_RES/ion-dist.asar" ] || die "缺少 $APP_RES/ion-dist.asar"
+
+  local ts stamp_dir tmp
+  ts="$(date +%Y%m%d-%H%M%S)"
+  stamp_dir="$BACKUP_DIR/$ts"
+  mkdir -p "$stamp_dir"
+  tmp="$(mktemp -d)"
+
+  discard_stale_backups
+  echo "[1/4] 备份当前版本并生成简体中文资源"
+  if [ ! -f "$APP_RES/ion-dist.asar.zh-orig" ]; then
+    sudo cp -a "$APP_RES/ion-dist.asar" "$APP_RES/ion-dist.asar.zh-orig"
+  fi
+  cp -a "$APP_RES/ion-dist.asar.zh-orig" "$tmp/ion-dist.asar"
+  cp -a "$APP_RES/ion-dist.asar.zh-orig" "$stamp_dir/ion-dist.asar"
+
+  echo "[2/4] 解包、汉化并重建前端 ASAR"
+  python3 "$REPO_DIR/scripts/patch_linux_frontend.py" "$tmp/ion-dist.asar" "$SUFFIX"
+
+  echo "[3/4] 安装补丁文件"
+  sudo install -m 644 "$tmp/ion-dist.asar" "$APP_RES/ion-dist.asar"
+
+  echo "[4/4] 写入用户语言并核验安装结果"
+  set_user_locale
+  cmp -s "$tmp/ion-dist.asar" "$APP_RES/ion-dist.asar" || die "ion-dist.asar 安装后校验不一致"
+  rm -rf "$tmp"
+  echo
+  echo "完成！请重新打开 Claude Desktop。"
+  echo "备份位于: $stamp_dir 及系统资源旁的 *.zh-orig 文件"
+}
+
 install() {
+  if [ -f "$APP_RES/ion-dist.asar" ]; then
+    install_asar_frontend
+    return
+  fi
   command -v python3 >/dev/null || die "需要 python3"
   [ -f "$FRONTEND_SRC" ] || die "缺少 $FRONTEND_SRC"
   [ -f "$DESKTOP_SRC" ] || die "缺少 $DESKTOP_SRC"
@@ -165,15 +222,7 @@ PY
   sudo install -m 644 "$tmp/app.asar" "$APP_RES/app.asar"
 
   echo "[5/5] 写入用户配置 locale=$SUFFIX"
-  python3 - "$HOME/.config/Claude/config.json" "$SUFFIX" <<'PY'
-import json, sys, os
-path, lang = sys.argv[1:3]
-cfg = {}
-if os.path.exists(path):
-    cfg = json.load(open(path))
-cfg["locale"] = lang
-json.dump(cfg, open(path, "w"), ensure_ascii=False, indent="\t")
-PY
+  set_user_locale
   rm -rf "$tmp"
   echo
   echo "完成！请重新打开 Claude Desktop。如未生效，在左下角账号菜单选择 Language -> 中文。"
@@ -201,16 +250,13 @@ uninstall() {
   else
     echo "  未找到 app.asar.zh-orig（可能已还原或从未安装）"
   fi
+  if [ -f "$APP_RES/ion-dist.asar.zh-orig" ]; then
+    sudo mv "$APP_RES/ion-dist.asar.zh-orig" "$APP_RES/ion-dist.asar"
+    echo "  已还原: ion-dist.asar"
+  fi
   sudo rm -f "$APP_RES/.zh-orig-version"
   echo "[4/4] 重置用户 locale 为 en-US"
-  python3 - "$HOME/.config/Claude/config.json" <<'PY'
-import json, sys, os
-path = sys.argv[1]
-if os.path.exists(path):
-    cfg = json.load(open(path))
-    cfg["locale"] = "en-US"
-    json.dump(cfg, open(path, "w"), ensure_ascii=False, indent="\t")
-PY
+  SUFFIX="en-US" set_user_locale
   echo "完成！请重新打开 Claude Desktop。"
 }
 
